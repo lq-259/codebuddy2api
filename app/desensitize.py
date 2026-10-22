@@ -123,6 +123,7 @@ _TEMPLATE_REPLACEMENTS = tuple(
         ("You are a Claude agent, built on Anthropic's Claude Agent SDK", _WORKBUDDY_IDENTITY),
         ("Main branch (you will usually use this for PRs)",
          "Main branch (you will usually use this for PR)"),
+        ("You are an AI agent powered by DeepSeek Harness.", "You are a helpful AI assistant."),
     )
 )
 _WORKBUDDY_IDENTITY_PATTERN = _template_pattern(_WORKBUDDY_IDENTITY)
