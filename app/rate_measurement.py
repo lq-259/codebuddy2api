@@ -178,10 +178,13 @@ class ProbeError(RuntimeError):
         self.code = code
 
 
-def _upstream_error(response, raw=b""):
-    """Status plus upstream's own code and message, which say why a model was refused."""
+def _upstream_error(response, raw=None):
+    """Status plus upstream's own code and message, which say why a model was refused.
+
+    ``raw`` holds error bytes already consumed from the stream; None means the body is still unread.
+    """
     try:
-        data = json.loads(raw[:4096] if raw else response.read()[:4096])
+        data = json.loads((response.read() if raw is None else raw)[:4096])
     except (ValueError, httpx.HTTPError):
         data = None
     code = data.get("code") if isinstance(data, dict) else None
@@ -190,6 +193,7 @@ def _upstream_error(response, raw=b""):
     else:
         message = f"上游 HTTP {response.status_code}"
     return ProbeError(message, response.status_code, None if code is None else str(code))
+
 
 def probe_once(url, headers, model, *, timeout=120.0):
     """Send one real request and return the upstream-reported billing sample."""

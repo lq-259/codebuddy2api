@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 import re
 from urllib.parse import urlsplit, urlunsplit
 
@@ -11,9 +12,13 @@ _SCHEMA_ARRAYS = frozenset(("allOf", "anyOf", "oneOf", "prefixItems", "items"))
 _SCHEMA_CHILDREN = frozenset(("items", "additionalItems", "contains", "unevaluatedItems",
                               "additionalProperties", "unevaluatedProperties", "propertyNames",
                               "not", "if", "then", "else", "contentSchema"))
-_CHANNEL_CODE = re.compile(r"""(['"])code\1\s*:\s*(['"]?)(?:11128|11-128)\2(?!\d)""", re.IGNORECASE)
+# Backslashes allow the code to sit in JSON that upstream embedded as an escaped string.
+_CHANNEL_CODE = re.compile(r"""(['"])code\\*\1\s*:\s*\\*(['"]?)(?:11128|11-128)\\*\2(?!\d)""",
+                           re.IGNORECASE)
 _CHANNEL_TEXT = ("channel verification", "official client", "illegal api invocation from an unapproved channel")
 _UNDERSCORE_ESCAPES = re.compile(r"\\+_")
+# A schema string containing "\_" serializes as "\\_" in JSON.
+_ESCAPED_UNDERSCORE = "\\\\_"
 
 
 def _normalize_pattern(value):
@@ -40,14 +45,10 @@ def _normalize_schema_patterns(schema) -> None:
         normalized = {}
         for key, value in properties.items():
             normalized_key = _normalize_pattern(key)
-            existing = normalized.get(normalized_key)
-            if existing is None:
-                normalized[normalized_key] = value
-            elif isinstance(existing, dict) and isinstance(value, dict):
-                # Merge colliding keys so neither the escape nor the original constraint is lost.
-                normalized[normalized_key] = {"allOf": [existing, value]}
-            else:
-                normalized[normalized_key] = value
+            if normalized_key in normalized:
+                # allOf also accepts boolean schemas, so no colliding constraint is lost.
+                value = {"allOf": [normalized[normalized_key], value]}
+            normalized[normalized_key] = value
         schema["patternProperties"] = normalized
     for key in _SCHEMA_MAPS:
         value = schema.get(key)
@@ -63,25 +64,35 @@ def _normalize_schema_patterns(schema) -> None:
         _normalize_schema_patterns(schema.get(key))
 
 
+def _has_underscore_escape(value) -> bool:
+    """Cheaply detect a backslash before an underscore anywhere in a JSON-compatible value."""
+    try:
+        return _ESCAPED_UNDERSCORE in json.dumps(value, ensure_ascii=False, default=str)
+    except (TypeError, ValueError, RecursionError):
+        return True
+
+
 def normalize_tool_patterns(body: dict) -> dict:
-    """Copy and normalize tool declarations and structured-output schemas."""
-    result = dict(body)
+    """Normalize tool declarations and structured-output schemas, copying only what changes."""
+    result = body
     for key in ("tools", "functions"):
-        tools = result.get(key)
-        if not isinstance(tools, list):
+        tools = body.get(key)
+        if not isinstance(tools, list) or not _has_underscore_escape(tools):
             continue
-        result[key] = deepcopy(tools)
-        for tool in result[key]:
+        result = result if result is not body else dict(body)
+        result[key] = tools = deepcopy(tools)
+        for tool in tools:
             if not isinstance(tool, dict):
                 continue
             function = tool.get("function")
             if isinstance(function, dict):
                 _normalize_schema_patterns(function.get("parameters"))
             _normalize_schema_patterns(tool.get("parameters"))
-    response_format = result.get("response_format")
-    if isinstance(response_format, dict):
-        result["response_format"] = deepcopy(response_format)
-        json_schema = result["response_format"].get("json_schema")
+    response_format = body.get("response_format")
+    if isinstance(response_format, dict) and _has_underscore_escape(response_format):
+        result = result if result is not body else dict(body)
+        result["response_format"] = response_format = deepcopy(response_format)
+        json_schema = response_format.get("json_schema")
         if isinstance(json_schema, dict):
             _normalize_schema_patterns(json_schema.get("schema"))
     return result

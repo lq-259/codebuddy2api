@@ -13,6 +13,7 @@ import httpx
 from app.content_filter import ContentFilterDetector
 from app.upstream_compat import should_channel_fallback
 
+
 class UpstreamResponseError(Exception):
     """Preserve upstream HTTP status and error bytes for protocol-specific mapping."""
 
@@ -364,8 +365,6 @@ class _BoundedBuffer:
 
     def extend(self, chunk: bytes) -> bool:
         """Add one chunk and report whether the budget is exhausted."""
-        if self.limit <= 0:
-            return True
         self.buf.extend(chunk[:self.limit - len(self.buf)])
         return len(self.buf) >= self.limit
 
@@ -399,19 +398,21 @@ def read_bounded_sync_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
 def open_backend_stream_sync(client, url, headers, body, *, timeout=None, fallback_url=None):
     """Open a sync upstream stream, retrying once on the console endpoint after a channel rejection.
 
-    Yields the final response together with any error bytes already consumed. The body is read only
-    for a 400 that could still be retried, so slow non-400 failures never block background work.
+    Yields the final response with its error bytes when they were already consumed, otherwise None.
+    The body is read only for a 400 that could still be retried, so slow non-400 failures never block
+    background work.
     """
-    raw = b""
     while True:
+        raw = None
         with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as response:
-            if response.status_code != 200 and fallback_url and response.status_code == 400:
+            if fallback_url and response.status_code == 400:
                 raw = read_bounded_sync_error(response)
                 if should_channel_fallback(fallback_url, response.status_code, raw):
                     url, fallback_url = fallback_url, None
                     continue
             yield response, raw
             return
+
 
 # Connection failures occur before any request body is sent.
 BODY_NOT_ACCEPTED = (httpx.ConnectError, httpx.ConnectTimeout)
