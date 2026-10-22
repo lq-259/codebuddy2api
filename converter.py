@@ -84,7 +84,8 @@ from app.rate_measurement import RateBook
 from app.inference_auth import require_api_key
 from app.admin_auth import SessionStoreError
 from app.content_filter import ContentFilterDetector, is_filter_error
-from app.upstream_compat import channel_fallback_url, normalize_tool_patterns, should_channel_fallback
+from app.upstream_compat import (channel_fallback_url, is_channel_check_error, normalize_tool_patterns,
+                                 should_channel_fallback)
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app import perf_metrics
@@ -1359,14 +1360,17 @@ class CredentialPool:
 
     def note_status(self, cm: CredentialManager | None, status: int,
                     model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None,
-                    model_block=True):
+                    channel_fallback=False):
         """Apply credential-wide auth cooldowns, per-model 429 cooldowns and backend/model backoff."""
         if cm is None:
             return
         if status in (401, 403):
             self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
             return
-        not_servable = _parse_not_servable(raw, status) if model and model_block else None
+        if status == 400 and not channel_fallback and is_channel_check_error(raw):
+            self.cooldown(cm, reason="backend channel check (HTTP 400)", generation=generation)
+            return
+        not_servable = _parse_not_servable(raw, status) if model else None
         if not_servable:
             self.note_not_servable(cm, model, code=not_servable[0], msg=not_servable[1], generation=generation)
             return
@@ -2705,8 +2709,7 @@ def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = 
     if pool is not None and cred is not None:
         cm, generation = cred if isinstance(cred, tuple) else (cred, None)
         pool.note_status(cm, status, model=model, raw=raw, generation=generation, retry_after=retry_after,
-                         model_block=not from_channel_fallback)
-
+                         channel_fallback=from_channel_fallback)
 @app.get("/health")
 def health():
     """Return public liveness without accessing or exposing credentials."""
@@ -4368,7 +4371,9 @@ def _failover_safe(error, raw=b"") -> bool:
     if isinstance(error, UpstreamHTTPError):
         if error.status in FAILOVER_CODES:
             return True
-        return (getattr(error, "from_channel_fallback", False)
+        if error.status == 400 and is_channel_check_error(raw):
+            return not error.from_channel_fallback
+        return (error.from_channel_fallback
                 and _parse_not_servable(raw, error.status) is not None)
     if isinstance(error, UpstreamResponseError):
         return False

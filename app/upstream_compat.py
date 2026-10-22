@@ -40,9 +40,14 @@ def _normalize_schema_patterns(schema) -> None:
         normalized = {}
         for key, value in properties.items():
             normalized_key = _normalize_pattern(key)
-            if normalized_key != key and (normalized_key in properties or normalized_key in normalized):
-                normalized_key = key  # Never discard one side of a post-normalization collision.
-            normalized[normalized_key] = value
+            existing = normalized.get(normalized_key)
+            if existing is None:
+                normalized[normalized_key] = value
+            elif isinstance(existing, dict) and isinstance(value, dict):
+                # Merge colliding keys so neither the escape nor the original constraint is lost.
+                normalized[normalized_key] = {"allOf": [existing, value]}
+            else:
+                normalized[normalized_key] = value
         schema["patternProperties"] = normalized
     for key in _SCHEMA_MAPS:
         value = schema.get(key)

@@ -26,6 +26,8 @@ import time
 import httpx
 
 from .observability import normalize_usage
+from .upstream_compat import channel_fallback_url
+from .upstream_io import open_backend_stream_sync
 
 WINDOW_S = 7 * 86400
 # A model counts as billed when any of its latest samples was charged; a returning
@@ -176,10 +178,10 @@ class ProbeError(RuntimeError):
         self.code = code
 
 
-def _upstream_error(response):
+def _upstream_error(response, raw=b""):
     """Status plus upstream's own code and message, which say why a model was refused."""
     try:
-        data = json.loads(response.read()[:4096])
+        data = json.loads(raw[:4096] if raw else response.read()[:4096])
     except (ValueError, httpx.HTTPError):
         data = None
     code = data.get("code") if isinstance(data, dict) else None
@@ -189,7 +191,6 @@ def _upstream_error(response):
         message = f"上游 HTTP {response.status_code}"
     return ProbeError(message, response.status_code, None if code is None else str(code))
 
-
 def probe_once(url, headers, model, *, timeout=120.0):
     """Send one real request and return the upstream-reported billing sample."""
     body = {"model": model, "stream": True, "stream_options": {"include_usage": True}, "max_tokens": 16,
@@ -197,9 +198,11 @@ def probe_once(url, headers, model, *, timeout=120.0):
                          {"role": "user", "content": probe_prompt()}]}
     usage = None
     with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(timeout, connect=10)) as client:
-        with client.stream("POST", url, headers={**headers, "Accept": "text/event-stream"}, json=body) as response:
+        with open_backend_stream_sync(
+                client, url, {**headers, "Accept": "text/event-stream"}, body,
+                fallback_url=channel_fallback_url(url)) as (response, raw):
             if response.status_code != 200:
-                raise _upstream_error(response)
+                raise _upstream_error(response, raw)
             for line in response.iter_lines():
                 if not line.startswith("data:"):
                     continue

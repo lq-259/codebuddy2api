@@ -14,7 +14,7 @@ from unittest.mock import patch
 import httpx
 
 import converter
-from app import buddy_task, growth_events
+from app import buddy_task, growth_events, rate_measurement
 from app.upstream_compat import channel_fallback_url, is_channel_check_error, normalize_tool_patterns
 from tests import test_region_routing as fixtures
 
@@ -74,8 +74,8 @@ class ToolPatternTests(unittest.TestCase):
         }}]}
         result = normalize_tool_patterns(body)
         schema = result["tools"][0]["parameters"]
-        self.assertEqual(schema["patternProperties"][r"a\_b"], {"const": "original"})
-        self.assertEqual(schema["patternProperties"]["a_b"], {"const": "existing"})
+        self.assertEqual(schema["patternProperties"]["a_b"],
+                         {"allOf": [{"const": "original"}, {"const": "existing"}]})
         self.assertEqual(schema["properties"]["single"]["pattern"], "a_b")
         self.assertEqual(schema["properties"]["double"]["pattern"], r"a\\_b")
         self.assertEqual(schema["properties"]["triple"]["pattern"], r"a\\_b")
@@ -122,6 +122,14 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
 
     def handle_upstream(self, request):
         path = request.url.path
+        if path == "/agenttool/v1/search":
+            uid = self.record(request)
+            if self.channel_mode == "always":
+                return httpx.Response(400, json=CHANNEL_ERROR)
+            return httpx.Response(200, json={"query": "synthetic", "type": "text2text", "provider": "1",
+                                             "results": [{"title": "t", "url": "https://example.com/",
+                                                          "snippet": "s", "site": "example.com"}],
+                                             "total_results": 1, "response_time_ms": 1})
         if self.channel_mode and path in ("/v2/chat/completions", "/console/chat/completions"):
             uid = self.record(request)
             if self.channel_mode in ("first", "model_missing") and self.channel_uid is None:
@@ -212,16 +220,16 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                          ["/v2/chat/completions", "/console/chat/completions"])
         self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
 
-    def test_console_model_missing_does_not_block_account_or_model(self):
+    def test_console_model_missing_blocks_the_model_without_cooling_the_account(self):
         self.configure_profiles("cn-cli")
         self.channel_mode = "model_missing"
         response = self.client.post("/v1/chat/completions", json=self.payload())
         self.assertEqual(response.status_code, 400, response.text)
         entry = self.current_entry("cn-cli")
         self.assertLessEqual(entry["fail_until"], time.time())
-        self.assertTrue(self.pool._model_servable(entry, "shared-model"))
+        self.assertFalse(self.pool._model_servable(entry, "shared-model"))
 
-    def test_console_model_missing_can_fail_over_without_penalizing_rejected_account(self):
+    def test_console_model_missing_can_fail_over_without_cooling_the_account(self):
         self.configure_profiles("cn-cli", "cn-work")
         self.channel_mode = "model_missing"
         with patch.dict(converter.CONFIG, {"failover_max": 1}):
@@ -232,7 +240,17 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(self.requests[1].headers["x-user-id"], first_uid)
         self.assertNotEqual(self.requests[2].headers["x-user-id"], first_uid)
         self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
-        self.assertTrue(self.pool._model_servable(self.current_entry(first_uid), "shared-model"))
+
+    def test_search_channel_rejection_cools_and_fails_over(self):
+        self.configure_profiles("cn-cli", "cn-work")
+        self.channel_mode = "always"
+        with patch.dict(converter.CONFIG, {"failover_max": 1}):
+            response = self.client.post("/v1/search", json={"query": "synthetic", "max_results": 3})
+        first_uid = self.requests[0].headers["x-user-id"]
+        self.assertEqual([request.url.path for request in self.requests], ["/agenttool/v1/search"] * 2)
+        self.assertNotEqual(self.requests[1].headers["x-user-id"], first_uid)
+        self.assertGreater(self.current_entry(first_uid)["fail_until"], time.time())
+        self.assertEqual(response.status_code, 400, response.text)
 
 class AutomationCompatTests(unittest.TestCase):
     def transport(self):
@@ -256,25 +274,61 @@ class AutomationCompatTests(unittest.TestCase):
         self.assertEqual([request.url.path for request in calls],
                          ["/v2/chat/completions", "/console/chat/completions"])
 
-    def test_growth_chat_uses_console_after_channel_rejection(self):
+    def test_growth_chat_never_falls_back_so_the_reported_id_stays_valid(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request)
+            return httpx.Response(400, json=CHANNEL_ERROR)
+
+        transport = httpx.MockTransport(handle)
+        real_client = growth_events.httpx.Client
+        with patch.object(growth_events.httpx, "Client",
+                          side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
+            with self.assertRaises(growth_events.Failure):
+                growth_events.desktop_chat("https://synthetic.invalid", {})
+        self.assertEqual([request.url.path for request in calls], ["/v2/chat/completions"])
+
+    def test_rate_probe_uses_console_after_channel_rejection(self):
         calls = []
 
         def handle(request):
             calls.append(request)
             if request.url.path == "/v2/chat/completions":
                 return httpx.Response(400, json=CHANNEL_ERROR)
-            content = b'data: {"id":"c8841c64745dae0d0682955929284e70","choices":[]}\n\n'
+            content = (b'data: {"usage":{"credit":0.5,"input_tokens":4,"output_tokens":2}}\n\n'
+                       b"data: [DONE]\n\n")
             return httpx.Response(200, content=content, headers={"Content-Type": "text/event-stream"})
 
         transport = httpx.MockTransport(handle)
-        real_client = growth_events.httpx.Client
-        with patch.object(growth_events.httpx, "Client",
+        real_client = rate_measurement.httpx.Client
+        with patch.object(rate_measurement.httpx, "Client",
                           side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
-            conversation, server_id = growth_events.desktop_chat("https://synthetic.invalid", {})
-        self.assertTrue(conversation.startswith("wb2api-conv-"))
-        self.assertEqual(server_id, "c8841c64745dae0d0682955929284e70")
+            result = rate_measurement.probe_once("https://synthetic.invalid/v2/chat/completions", {},
+                                                 "shared", timeout=5)
+        self.assertEqual(result["credit"], 0.5)
         self.assertEqual([request.url.path for request in calls],
                          ["/v2/chat/completions", "/console/chat/completions"])
+        self.assertEqual([request.url.path for request in calls],
+                         ["/v2/chat/completions", "/console/chat/completions"])
+
+    def test_rate_probe_surfaces_the_console_error_without_retrying(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request)
+            return httpx.Response(400, json={"code": 11102, "msg": "model service info not found"})
+
+        real_client = rate_measurement.httpx.Client
+        with patch.object(rate_measurement.httpx, "Client",
+                          side_effect=lambda **kwargs: real_client(transport=httpx.MockTransport(handle),
+                                                                   **kwargs)):
+            with self.assertRaises(rate_measurement.ProbeError) as caught:
+                rate_measurement.probe_once("https://synthetic.invalid/v2/chat/completions", {}, "shared",
+                                            timeout=5)
+        self.assertEqual(caught.exception.status_code, 400)
+        self.assertEqual(caught.exception.code, "11102")
+        self.assertEqual([request.url.path for request in calls], ["/v2/chat/completions"])
 
 
 
