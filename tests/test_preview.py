@@ -149,6 +149,14 @@ class UpstreamTests(Isolated):
         self.assertIn("模拟回复", text)
         self.assertGreater(events[-1]["usage"]["credit"], 0)
 
+    def test_console_chat_uses_the_same_simulated_upstream(self):
+        token, _, _ = login("aurora")
+        response = httpx.post("https://copilot.tencent.com/console/chat/completions",
+                              headers={"Authorization": f"Bearer {token}"},
+                              json={"model": "glm-5.1", "messages": [{"role": "user", "content": "你好"}]})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIn("data: [DONE]", response.text)
+
     def test_chat_directives(self):
         self.assertEqual(self.chat("[preview:429]")[0].status_code, 429)
         self.assertEqual(self.chat("[preview:500]")[0].status_code, 500)

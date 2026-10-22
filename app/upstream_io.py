@@ -1,7 +1,7 @@
 """Bound upstream retries and prohibit replay after a response has opened."""
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import timezone
 from email.utils import parsedate_to_datetime
 import math
@@ -11,6 +11,7 @@ import json
 import httpx
 
 from app.content_filter import ContentFilterDetector
+from app.upstream_compat import should_channel_fallback
 
 
 class UpstreamResponseError(Exception):
@@ -25,9 +26,10 @@ class UpstreamResponseError(Exception):
 class UpstreamHTTPError(UpstreamResponseError):
     """Distinguish actual upstream HTTP errors from failures synthesized while collecting a response."""
 
-    def __init__(self, status, raw, *, retry_after=None):
+    def __init__(self, status, raw, *, retry_after=None, from_channel_fallback=False):
         super().__init__(status, raw)
         self.retry_after = retry_after
+        self.from_channel_fallback = from_channel_fallback
         self.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
 
 
@@ -354,16 +356,62 @@ class ChatSSEAccumulator:
 ERROR_BODY_LIMIT = 4 * 1024 * 1024  # Bound error-body memory usage.
 
 
+class _BoundedBuffer:
+    """Accumulate upstream error bytes until a fixed memory budget is reached."""
+
+    def __init__(self, limit: int):
+        self.limit = limit
+        self.buf = bytearray()
+
+    def extend(self, chunk: bytes) -> bool:
+        """Add one chunk and report whether the budget is exhausted."""
+        self.buf.extend(chunk[:self.limit - len(self.buf)])
+        return len(self.buf) >= self.limit
+
+    def bytes(self) -> bytes:
+        return bytes(self.buf)
+
+
 async def read_bounded_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
     """Read and truncate upstream error bytes within a fixed budget."""
     if limit <= 0:
         return b""
-    buf = bytearray()
+    buffer = _BoundedBuffer(limit)
     async for chunk in response.aiter_bytes():
-        buf.extend(chunk[:limit - len(buf)])
-        if len(buf) >= limit:
+        if buffer.extend(chunk):
             break
-    return bytes(buf)
+    return buffer.bytes()
+
+
+def read_bounded_sync_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
+    """Read and truncate a synchronous upstream error body within a fixed budget."""
+    if limit <= 0:
+        return b""
+    buffer = _BoundedBuffer(limit)
+    for chunk in response.iter_bytes():
+        if buffer.extend(chunk):
+            break
+    return buffer.bytes()
+
+
+@contextmanager
+def open_backend_stream_sync(client, url, headers, body, *, timeout=None, fallback_url=None):
+    """Open a sync upstream stream, retrying once on the console endpoint after a channel rejection.
+
+    Yields the final response with its error bytes when they were already consumed, otherwise None.
+    The body is read only for a 400 that could still be retried, so slow non-400 failures never block
+    background work.
+    """
+    while True:
+        raw = None
+        with client.stream("POST", url, headers=headers, json=body, timeout=timeout) as response:
+            if fallback_url and response.status_code == 400:
+                raw = read_bounded_sync_error(response)
+                if should_channel_fallback(fallback_url, response.status_code, raw):
+                    url, fallback_url = fallback_url, None
+                    continue
+            yield response, raw
+            return
 
 
 # Connection failures occur before any request body is sent.

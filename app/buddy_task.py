@@ -5,7 +5,8 @@ import time
 import httpx
 
 from .site_routing import PROFILE_ENDPOINTS, profile_for_headers
-from .upstream_io import ChatSSEAccumulator, UpstreamResponseError
+from .upstream_compat import channel_fallback_url
+from .upstream_io import ChatSSEAccumulator, UpstreamResponseError, open_backend_stream_sync
 
 MAX_OUTPUT_TOKENS = 32
 MAX_CHAT_BYTES = 64 * 1024
@@ -57,8 +58,10 @@ def _chat(client, headers, record, model):
         {"role": "user", "content": PROMPT}], "stream": True, "stream_options": {"include_usage": True},
         "max_tokens": MAX_OUTPUT_TOKENS, "extra_vars": {"growthEvent": json.dumps([event], separators=(",", ":"))}}
     started = time.monotonic()
-    with client.stream("POST", PROFILE_ENDPOINTS["cn-work"] + "/v2/chat/completions", headers=headers,
-                       json=body, timeout=httpx.Timeout(15, connect=5, write=10, pool=5)) as response:
+    url = PROFILE_ENDPOINTS["cn-work"] + "/v2/chat/completions"
+    with open_backend_stream_sync(client, url, headers=headers, body=body,
+                                  timeout=httpx.Timeout(15, connect=5, write=10, pool=5),
+                                  fallback_url=channel_fallback_url(url)) as (response, _):
         if response.status_code != 200:
             raise TaskFailure("http", response.status_code)
         if not response.headers.get("content-type", "").lower().startswith("text/event-stream"):

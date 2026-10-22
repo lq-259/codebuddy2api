@@ -267,8 +267,7 @@ def desktop_chat(base, headers, expert_id="", model=FAST_MODEL, prompt="1+1ç­‰äº
     if expert_id:
         outgoing["X-Expert-Id"] = expert_id
     with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(60, connect=10)) as client:
-        with client.stream("POST", base + "/v2/chat/completions", headers=outgoing,
-                           json=body) as response:
+        with client.stream("POST", base + "/v2/chat/completions", headers=outgoing, json=body) as response:
             if response.status_code != 200:
                 raise Failure("http", response.status_code)
             searched = 0
