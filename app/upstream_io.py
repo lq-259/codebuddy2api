@@ -25,11 +25,11 @@ class UpstreamResponseError(Exception):
 class UpstreamHTTPError(UpstreamResponseError):
     """Distinguish actual upstream HTTP errors from failures synthesized while collecting a response."""
 
-    def __init__(self, status, raw, *, retry_after=None):
+    def __init__(self, status, raw, *, retry_after=None, from_channel_fallback=False):
         super().__init__(status, raw)
         self.retry_after = retry_after
+        self.from_channel_fallback = from_channel_fallback
         self.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
-
 
 MAX_RETRY_AFTER = 86400
 MAX_TOOL_CALLS = 256
@@ -360,6 +360,18 @@ async def read_bounded_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
         return b""
     buf = bytearray()
     async for chunk in response.aiter_bytes():
+        buf.extend(chunk[:limit - len(buf)])
+        if len(buf) >= limit:
+            break
+    return bytes(buf)
+
+
+def read_bounded_sync_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
+    """Read and truncate a synchronous upstream error body within a fixed budget."""
+    if limit <= 0:
+        return b""
+    buf = bytearray()
+    for chunk in response.iter_bytes():
         buf.extend(chunk[:limit - len(buf)])
         if len(buf) >= limit:
             break

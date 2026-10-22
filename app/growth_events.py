@@ -13,6 +13,8 @@ import secrets
 import time
 
 import httpx
+from .upstream_compat import channel_fallback_url, should_channel_fallback
+from .upstream_io import read_bounded_sync_error
 
 DESKTOP_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) WorkBuddyDesktop/5.5.6 "
               "Chrome/132.0.6834.83 Electron/34.0.0 Safari/537.36")
@@ -267,28 +269,36 @@ def desktop_chat(base, headers, expert_id="", model=FAST_MODEL, prompt="1+1等�
     if expert_id:
         outgoing["X-Expert-Id"] = expert_id
     with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(60, connect=10)) as client:
-        with client.stream("POST", base + "/v2/chat/completions", headers=outgoing,
-                           json=body) as response:
-            if response.status_code != 200:
-                raise Failure("http", response.status_code)
-            searched = 0
-            async_buffer = bytearray()
-            for chunk in response.iter_bytes():
-                async_buffer.extend(chunk)
-                raw = bytes(async_buffer)
-                index = raw.find(b'"id":"', searched)
-                while index >= 0:
-                    start = index + 6
-                    end = raw.find(b'"', start)
-                    if end > 0:
-                        candidate = raw[start:end].decode("utf-8", "replace")
-                        if SERVER_ID_RE.match(candidate):
-                            return conversation_id, candidate
-                        searched = index + 1
-                        index = raw.find(b'"id":"', searched)
-                    else:
-                        break
-                searched = max(0, len(raw) - 32)
+        url = base + "/v2/chat/completions"
+        fallback_url = channel_fallback_url(url)
+        while True:
+            with client.stream("POST", url, headers=outgoing, json=body) as response:
+                if response.status_code != 200:
+                    raw_error = read_bounded_sync_error(response)
+                    if should_channel_fallback(fallback_url, response.status_code, raw_error):
+                        url = fallback_url
+                        fallback_url = None
+                        continue
+                    raise Failure("http", response.status_code)
+                searched = 0
+                async_buffer = bytearray()
+                for chunk in response.iter_bytes():
+                    async_buffer.extend(chunk)
+                    raw = bytes(async_buffer)
+                    index = raw.find(b'"id":"', searched)
+                    while index >= 0:
+                        start = index + 6
+                        end = raw.find(b'"', start)
+                        if end > 0:
+                            candidate = raw[start:end].decode("utf-8", "replace")
+                            if SERVER_ID_RE.match(candidate):
+                                return conversation_id, candidate
+                            searched = index + 1
+                            index = raw.find(b'"id":"', searched)
+                        else:
+                            break
+                    searched = max(0, len(raw) - 32)
+            break
     raise Failure("protocol", message="SSE 中未找到服务端 requestId")
 
 

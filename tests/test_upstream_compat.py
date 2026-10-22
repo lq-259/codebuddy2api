@@ -14,6 +14,7 @@ from unittest.mock import patch
 import httpx
 
 import converter
+from app import buddy_task, growth_events
 from app.upstream_compat import channel_fallback_url, is_channel_check_error, normalize_tool_patterns
 from tests import test_region_routing as fixtures
 
@@ -62,6 +63,31 @@ class ToolPatternTests(unittest.TestCase):
         self.assertEqual(result["tools"][0]["parameters"]["pattern"], "a_b")
         self.assertEqual(result["functions"][0]["parameters"]["pattern"], "c_d")
 
+    def test_escape_parity_and_pattern_property_collisions_are_preserved(self):
+        body = {"tools": [{"name": "bare", "parameters": {
+            "patternProperties": {r"a\_b": {"const": "original"}, "a_b": {"const": "existing"}},
+            "properties": {
+                "single": {"pattern": r"a\_b"},
+                "double": {"pattern": r"a\\_b"},
+                "triple": {"pattern": r"a\\\_b"},
+            },
+        }}]}
+        result = normalize_tool_patterns(body)
+        schema = result["tools"][0]["parameters"]
+        self.assertEqual(schema["patternProperties"][r"a\_b"], {"const": "original"})
+        self.assertEqual(schema["patternProperties"]["a_b"], {"const": "existing"})
+        self.assertEqual(schema["properties"]["single"]["pattern"], "a_b")
+        self.assertEqual(schema["properties"]["double"]["pattern"], r"a\\_b")
+        self.assertEqual(schema["properties"]["triple"]["pattern"], r"a\\_b")
+
+    def test_response_format_json_schema_is_normalized(self):
+        body = {"response_format": {"type": "json_schema", "json_schema": {
+            "name": "result", "schema": {"properties": {"runId": {"pattern": r"^agent\_run\_"}}}}}}
+        result = normalize_tool_patterns(body)
+        schema = result["response_format"]["json_schema"]["schema"]
+        self.assertEqual(schema["properties"]["runId"]["pattern"], "^agent_run_")
+        self.assertEqual(body["response_format"]["json_schema"]["schema"]["properties"]["runId"]["pattern"], r"^agent\_run\_")
+
 
 class ChannelResponseTests(unittest.TestCase):
     def test_channel_detection_requires_code_and_text(self):
@@ -71,6 +97,7 @@ class ChannelResponseTests(unittest.TestCase):
         self.assertFalse(is_channel_check_error('{"code":11128,"msg":"blocked by security policy"}'))
         self.assertFalse(is_channel_check_error('{"msg":"channel verification"}'))
         self.assertFalse(is_channel_check_error('{"requestId":"11128","msg":"official client"}'))
+        self.assertFalse(is_channel_check_error('{"code":111280,"msg":"official client"}'))
 
     def test_only_primary_chat_url_has_console_fallback(self):
         self.assertEqual(channel_fallback_url("https://synthetic.invalid/v2/chat/completions"),
@@ -102,11 +129,11 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
             if path == "/console/chat/completions":
                 if self.channel_mode == "model_missing":
                     return httpx.Response(400, json=MODEL_MISSING)
-                if self.channel_mode == "first" and uid == self.channel_uid:
+                if self.channel_mode == "always" or (self.channel_mode == "first" and uid == self.channel_uid):
                     return httpx.Response(400, json=CHANNEL_ERROR)
                 return httpx.Response(200, content=fixtures.success_sse(),
                                       headers={"Content-Type": "text/event-stream"})
-            if self.channel_mode == "primary" or uid == self.channel_uid:
+            if self.channel_mode in ("primary", "always") or uid == self.channel_uid:
                 return httpx.Response(400, json=CHANNEL_ERROR)
             return httpx.Response(200, content=fixtures.success_sse(),
                                   headers={"Content-Type": "text/event-stream"})
@@ -140,6 +167,19 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
                 pattern = sent["tools"][0]["function"]["parameters"]["properties"]["runId"]["pattern"]
                 self.assertEqual(pattern, "^agent_run_")
 
+
+    def test_response_format_patterns_are_normalized_end_to_end(self):
+        self.configure_profiles("cn-cli")
+        for endpoint in ("chat/completions", "responses"):
+            with self.subTest(endpoint=endpoint):
+                payload = self.payload(endpoint)
+                payload["response_format"] = {"type": "json_schema", "json_schema": {
+                    "name": "result", "schema": {"properties": {"runId": {"pattern": r"^agent\_run\_"}}}}}
+                response = self.client.post("/v1/" + endpoint, json=payload)
+                self.assertEqual(response.status_code, 200, response.text)
+                sent = json.loads(self.requests[-1].content)
+                schema = sent["response_format"]["json_schema"]["schema"]
+                self.assertEqual(schema["properties"]["runId"]["pattern"], "^agent_run_")
     def test_channel_check_falls_back_for_every_protocol_and_stream_mode(self):
         self.configure_profiles("cn-cli")
         self.channel_mode = "primary"
@@ -159,19 +199,18 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         self.assertEqual(response.status_code, 400, response.text)
         self.assertEqual([request.url.path for request in self.requests], ["/v2/chat/completions"])
 
-    def test_final_channel_rejection_cools_account_and_uses_configured_failover(self):
+    def test_final_channel_rejection_is_terminal_without_cooling_or_failover(self):
         self.configure_profiles("cn-cli", "cn-work")
-        self.channel_mode = "first"
-        with patch.dict(converter.CONFIG, {"failover_max": 1}):
+        self.channel_mode = "always"
+        with patch.dict(converter.CONFIG, {"failover_max": 2}):
             response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(len(self.requests), 3)
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(len(self.requests), 2)
         first_uid = self.requests[0].headers["x-user-id"]
         self.assertEqual(self.requests[1].headers["x-user-id"], first_uid)
-        self.assertNotEqual(self.requests[2].headers["x-user-id"], first_uid)
-        self.assertEqual([request.url.path for request in self.requests[:2]],
+        self.assertEqual([request.url.path for request in self.requests],
                          ["/v2/chat/completions", "/console/chat/completions"])
-        self.assertGreater(self.current_entry(first_uid)["fail_until"], time.time())
+        self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
 
     def test_console_model_missing_does_not_block_account_or_model(self):
         self.configure_profiles("cn-cli")
@@ -181,6 +220,62 @@ class UpstreamCompatEndpointTests(fixtures.RegionRoutingTests):
         entry = self.current_entry("cn-cli")
         self.assertLessEqual(entry["fail_until"], time.time())
         self.assertTrue(self.pool._model_servable(entry, "shared-model"))
+
+    def test_console_model_missing_can_fail_over_without_penalizing_rejected_account(self):
+        self.configure_profiles("cn-cli", "cn-work")
+        self.channel_mode = "model_missing"
+        with patch.dict(converter.CONFIG, {"failover_max": 1}):
+            response = self.client.post("/v1/chat/completions", json=self.payload(stream=True))
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.requests), 3)
+        first_uid = self.requests[0].headers["x-user-id"]
+        self.assertEqual(self.requests[1].headers["x-user-id"], first_uid)
+        self.assertNotEqual(self.requests[2].headers["x-user-id"], first_uid)
+        self.assertLessEqual(self.current_entry(first_uid)["fail_until"], time.time())
+        self.assertTrue(self.pool._model_servable(self.current_entry(first_uid), "shared-model"))
+
+class AutomationCompatTests(unittest.TestCase):
+    def transport(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request)
+            if request.url.path == "/v2/chat/completions":
+                return httpx.Response(400, json=CHANNEL_ERROR)
+            return httpx.Response(200, content=fixtures.success_sse(),
+                                  headers={"Content-Type": "text/event-stream"})
+
+        return calls, httpx.MockTransport(handle)
+
+    def test_buddy_chat_uses_console_after_channel_rejection(self):
+        calls, transport = self.transport()
+        with httpx.Client(transport=transport) as client:
+            total = buddy_task._chat(client, {}, {"conversation_id": "conv", "request_id": "req"},
+                                     {"id": "shared-model", "name": "Shared"})
+        self.assertEqual(total, 3)
+        self.assertEqual([request.url.path for request in calls],
+                         ["/v2/chat/completions", "/console/chat/completions"])
+
+    def test_growth_chat_uses_console_after_channel_rejection(self):
+        calls = []
+
+        def handle(request):
+            calls.append(request)
+            if request.url.path == "/v2/chat/completions":
+                return httpx.Response(400, json=CHANNEL_ERROR)
+            content = b'data: {"id":"c8841c64745dae0d0682955929284e70","choices":[]}\n\n'
+            return httpx.Response(200, content=content, headers={"Content-Type": "text/event-stream"})
+
+        transport = httpx.MockTransport(handle)
+        real_client = growth_events.httpx.Client
+        with patch.object(growth_events.httpx, "Client",
+                          side_effect=lambda **kwargs: real_client(transport=transport, **kwargs)):
+            conversation, server_id = growth_events.desktop_chat("https://synthetic.invalid", {})
+        self.assertTrue(conversation.startswith("wb2api-conv-"))
+        self.assertEqual(server_id, "c8841c64745dae0d0682955929284e70")
+        self.assertEqual([request.url.path for request in calls],
+                         ["/v2/chat/completions", "/console/chat/completions"])
+
 
 
 if __name__ == "__main__":
