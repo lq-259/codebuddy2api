@@ -50,6 +50,15 @@ class WorkBuddyTextTests(unittest.TestCase):
                     desensitize_text(MAIN_BRANCH + suffix), MAIN_BRANCH_FIXED + suffix
                 )
 
+    def test_dsh_identity_uses_neutral_wording_without_touching_variants(self):
+        source = "You are an AI agent powered by DeepSeek Harness."
+        expected = "You are a helpful AI assistant."
+        self.assertEqual(desensitize_text(source), expected)
+        self.assertEqual(desensitize_text(source + "\nNext instruction."), expected + "\nNext instruction.")
+        self.assertEqual(desensitize_text(expected), expected)
+        variant = "You are a coding agent powered by the deepseek-v4.1-flash model."
+        self.assertEqual(desensitize_text(variant), variant)
+
     def test_case_whitespace_and_existing_zero_width_spaces(self):
         for source, expected in (
             *((identity, CODEBUDDY) for identity in IDENTITIES),

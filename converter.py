@@ -85,6 +85,8 @@ from app.inference_auth import require_api_key
 from app.admin_auth import SessionStoreError
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.tool_schema import normalize_tool_parameter_roots
+from app.upstream_compat import (channel_fallback_url, is_channel_check_error, normalize_tool_patterns,
+                                 should_channel_fallback)
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app import perf_metrics
@@ -1358,16 +1360,29 @@ class CredentialPool:
         _log(f"[cred] 凭证熔断 {CRED_COOLDOWN}s: {Path(cm.path).name} {reason}")
 
     def note_status(self, cm: CredentialManager | None, status: int,
-                    model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None):
+                    model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None,
+                    channel_fallback=False):
         """Apply credential-wide auth cooldowns, per-model 429 cooldowns and backend/model backoff."""
         if cm is None:
             return
         if status in (401, 403):
             self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
             return
+        if status == 400 and is_channel_check_error(raw):
+            # Only a rejection that survived the console retry is account-wide; endpoints without a
+            # console fallback (search, MCP) are left to request-scoped failover.
+            if channel_fallback:
+                self.cooldown(cm, reason="backend channel check (HTTP 400)", generation=generation)
+            return
         not_servable = _parse_not_servable(raw, status) if model else None
         if not_servable:
-            self.note_not_servable(cm, model, code=not_servable[0], msg=not_servable[1], generation=generation)
+            if channel_fallback:
+                # The console catalog is this account's detour, so its rejection must not block the
+                # shared domestic endpoint for accounts that still reach v2.
+                self._cool_model(cm, model, time.time() + MODEL_COOLDOWN, generation=generation,
+                                 reason=f"console {not_servable[0]}")
+            else:
+                self.note_not_servable(cm, model, code=not_servable[0], msg=not_servable[1], generation=generation)
             return
         if status != 429 or not model:
             return
@@ -1377,7 +1392,12 @@ class CredentialPool:
         else:
             reset = _parse_reset_time(raw)
             until = reset if reset is not None and reset > now else now + MODEL_COOLDOWN
-        until = min(until, now + MODEL_COOLDOWN_MAX)
+        self._cool_model(cm, model, min(until, now + MODEL_COOLDOWN_MAX), generation=generation,
+                         reason="HTTP 429")
+
+    def _cool_model(self, cm, model: str, until: float, *, generation=None, reason: str = ""):
+        """Cool one model on one credential, never shortening an existing cooldown."""
+        now = time.time()
         with self._lock, (cm._lock if generation is not None else nullcontext()):
             if not self._lease_matches(cm, generation):
                 return
@@ -1390,7 +1410,7 @@ class CredentialPool:
                     self._model_fail[key] = until
                     self._remember_model(e, routed_model, until)
         _log(f"[cred] 模型冷却 {model} @ {Path(cm.path).name} 至 "
-             f"{time.strftime('%m-%d %H:%M:%S', time.localtime(until))} (HTTP 429)")
+             f"{time.strftime('%m-%d %H:%M:%S', time.localtime(until))} ({reason})")
 
     def model_cooldown_until(self, model: str | None, *, region=None) -> float | None:
         """Return the earliest reset only when all healthy credentials are cooling down."""
@@ -2697,12 +2717,15 @@ def _note_cred_model_ok(cred, model: str | None) -> None:
         pool.note_model_ok(cm, model)
 
 
-def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b"", *, retry_after=None):
+def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b"", *, retry_after=None,
+                      from_channel_fallback=False):
     """Record generation-scoped authentication, quota and unsupported-model failures."""
     pool = CONFIG.get("cred_pool")
     if pool is not None and cred is not None:
         cm, generation = cred if isinstance(cred, tuple) else (cred, None)
-        pool.note_status(cm, status, model=model, raw=raw, generation=generation, retry_after=retry_after)
+        pool.note_status(cm, status, model=model, raw=raw, generation=generation, retry_after=retry_after,
+                         channel_fallback=from_channel_fallback)
+
 
 @app.get("/health")
 def health():
@@ -3562,6 +3585,7 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     body = normalize_tool_parameter_roots(body)
     _normalize_tool_choice(body)
     body["stream"] = True
+    body = normalize_tool_patterns(body)
     body.setdefault("stream_options", {"include_usage": True})
     body = _chat_body_desensitize(body)
     _guard_request_size(body)
@@ -4080,12 +4104,36 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
-def _check_upstream_status(status, raw, cred, model, *, headers=None):
+def _check_upstream_status(status, raw, cred, model, *, headers=None, from_channel_fallback=False):
     if status != 200:
         retry_after = parse_retry_after((headers or {}).get("Retry-After"))
         if not is_filter_error(raw):
-            _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after)
-        raise UpstreamHTTPError(status, raw, retry_after=retry_after)
+            _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after,
+                              from_channel_fallback=from_channel_fallback)
+        raise UpstreamHTTPError(status, raw, retry_after=retry_after,
+                                from_channel_fallback=from_channel_fallback)
+
+
+@asynccontextmanager
+async def _checked_chat_stream(url, headers, body, *, rid, model_name, cred):
+    """Open a chat stream that is HTTP 200, retrying once on /console after a v2 channel rejection."""
+    fallback_url = channel_fallback_url(url)
+    from_channel_fallback = False
+    while True:
+        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
+            if response.status_code == 200:
+                _note_cred_model_ok(cred, body.get("model"))
+                yield response
+                return
+            raw = await read_bounded_error(response)
+            if should_channel_fallback(fallback_url, response.status_code, raw):
+                observe_attempt("channel_check_fallback", status_code=response.status_code,
+                                profile=profile_for_headers(headers), upstream_model=body.get("model"))
+                _log(f"[{rid}] 上游渠道校验，切换 /console 端点重试 | {model_name}")
+                url, fallback_url, from_channel_fallback = fallback_url, None, True
+                continue
+            _check_upstream_status(response.status_code, raw, cred, body.get("model"),
+                                   headers=response.headers, from_channel_fallback=from_channel_fallback)
 
 
 def _upstream_failure(error, model_name, t0, rid):
@@ -4136,12 +4184,8 @@ async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *,
     while True:
         accumulator = ChatSSEAccumulator(max_collect_bytes=collection_limit)
         rejection = None
-        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
-            if response.status_code != 200:
-                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
-                                       headers=response.headers)
-            else:
-                _note_cred_model_ok(cred, body.get("model"))
+        async with _checked_chat_stream(url, headers, body, rid=rid, model_name=model_name,
+                                        cred=cred) as response:
             try:
                 result = await _collect_stream(response, accumulator=accumulator)
             except UpstreamResponseError as error:
@@ -4237,12 +4281,8 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
         CONFIG["log_body_limit"] if CONFIG.get("log_path") else 0)
     repairer = dsml.SSERepairer(dsml.tool_name_allowlist(body))
     try:
-        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
-            if response.status_code != 200:
-                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
-                                       headers=response.headers)
-            else:
-                _note_cred_model_ok(cred, body.get("model"))
+        async with _checked_chat_stream(url, headers, body, rid=rid, model_name=model_name,
+                                        cred=cred) as response:
             async for line in response.aiter_lines():
                 broken = False
                 for out_line in repairer.feed(line):
@@ -4337,7 +4377,12 @@ def _failover_safe(error, raw=b"") -> bool:
     if is_filter_error(raw):
         return False
     if isinstance(error, UpstreamHTTPError):
-        return error.status in FAILOVER_CODES
+        if error.status in FAILOVER_CODES:
+            return True
+        if error.status == 400 and is_channel_check_error(raw):
+            return True
+        return (error.from_channel_fallback
+                and _parse_not_servable(raw, error.status) is not None)
     if isinstance(error, UpstreamResponseError):
         return False
     if isinstance(error, WRITE_TIMEOUT_TRANSPORT):

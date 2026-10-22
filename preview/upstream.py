@@ -157,6 +157,7 @@ class Upstream:
             "/v2/billing/meter/daily-checkin": self.checkin,
             "/billing/ide/trial": self.trial,
             "/v2/chat/completions": self.chat,
+            "/console/chat/completions": self.chat,
             "/agenttool/v1/search": self.search,
             "/activity/growth/buddy/info": self.buddy_info,
             "/activity/growth/buddy/travel/status": self.travel_status,

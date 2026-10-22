@@ -26,6 +26,8 @@ import time
 import httpx
 
 from .observability import normalize_usage
+from .upstream_compat import channel_fallback_url
+from .upstream_io import open_backend_stream_sync
 
 WINDOW_S = 7 * 86400
 # A model counts as billed when any of its latest samples was charged; a returning
@@ -176,10 +178,13 @@ class ProbeError(RuntimeError):
         self.code = code
 
 
-def _upstream_error(response):
-    """Status plus upstream's own code and message, which say why a model was refused."""
+def _upstream_error(response, raw=None):
+    """Status plus upstream's own code and message, which say why a model was refused.
+
+    ``raw`` holds error bytes already consumed from the stream; None means the body is still unread.
+    """
     try:
-        data = json.loads(response.read()[:4096])
+        data = json.loads((response.read() if raw is None else raw)[:4096])
     except (ValueError, httpx.HTTPError):
         data = None
     code = data.get("code") if isinstance(data, dict) else None
@@ -197,9 +202,11 @@ def probe_once(url, headers, model, *, timeout=120.0):
                          {"role": "user", "content": probe_prompt()}]}
     usage = None
     with httpx.Client(follow_redirects=False, timeout=httpx.Timeout(timeout, connect=10)) as client:
-        with client.stream("POST", url, headers={**headers, "Accept": "text/event-stream"}, json=body) as response:
+        with open_backend_stream_sync(
+                client, url, {**headers, "Accept": "text/event-stream"}, body,
+                fallback_url=channel_fallback_url(url)) as (response, raw):
             if response.status_code != 200:
-                raise _upstream_error(response)
+                raise _upstream_error(response, raw)
             for line in response.iter_lines():
                 if not line.startswith("data:"):
                     continue
