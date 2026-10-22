@@ -5,6 +5,7 @@ Use your **WorkBuddy / CodeBuddy (Tencent)** subscription as local **OpenAI- and
 [中文文档](README.zh-CN.md)
 
 - Chat Completions, Responses and Anthropic Messages, with tool calling and streaming.
+- Compatible tool-schema and channel handling across all three inference protocols.
 - Built-in **WebUI** for browser login, models, credentials, logs and settings — no desktop client required.
 - Automatic multi-account routing across domestic and international sites, with credential refresh.
 - Per-account automation: domestic personal accounts check in and dispatch Buddy travel by default, with independent switches; international check-in is opt-in. The growth center is personal-only: finished tasks are claimed automatically, with per-task switches for behavior chains; enterprise accounts are excluded.

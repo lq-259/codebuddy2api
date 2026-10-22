@@ -84,6 +84,7 @@ from app.rate_measurement import RateBook
 from app.inference_auth import require_api_key
 from app.admin_auth import SessionStoreError
 from app.content_filter import ContentFilterDetector, is_filter_error
+from app.upstream_compat import channel_fallback_url, is_channel_check_error, normalize_tool_patterns
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
 from app import perf_metrics
@@ -1357,14 +1358,18 @@ class CredentialPool:
         _log(f"[cred] 凭证熔断 {CRED_COOLDOWN}s: {Path(cm.path).name} {reason}")
 
     def note_status(self, cm: CredentialManager | None, status: int,
-                    model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None):
+                    model: str | None = None, raw: bytes = b"", *, generation=None, retry_after=None,
+                    model_block=True):
         """Apply credential-wide auth cooldowns, per-model 429 cooldowns and backend/model backoff."""
         if cm is None:
             return
         if status in (401, 403):
             self.cooldown(cm, reason=f"backend HTTP {status}", generation=generation)
             return
-        not_servable = _parse_not_servable(raw, status) if model else None
+        if status == 400 and is_channel_check_error(raw):
+            self.cooldown(cm, reason="backend channel check (HTTP 400)", generation=generation)
+            return
+        not_servable = _parse_not_servable(raw, status) if model and model_block else None
         if not_servable:
             self.note_not_servable(cm, model, code=not_servable[0], msg=not_servable[1], generation=generation)
             return
@@ -2696,12 +2701,14 @@ def _note_cred_model_ok(cred, model: str | None) -> None:
         pool.note_model_ok(cm, model)
 
 
-def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b"", *, retry_after=None):
+def _note_cred_status(cred, status: int, model: str | None = None, raw: bytes = b"", *, retry_after=None,
+                      from_channel_fallback=False):
     """Record generation-scoped authentication, quota and unsupported-model failures."""
     pool = CONFIG.get("cred_pool")
     if pool is not None and cred is not None:
         cm, generation = cred if isinstance(cred, tuple) else (cred, None)
-        pool.note_status(cm, status, model=model, raw=raw, generation=generation, retry_after=retry_after)
+        pool.note_status(cm, status, model=model, raw=raw, generation=generation, retry_after=retry_after,
+                         model_block=not from_channel_fallback)
 
 @app.get("/health")
 def health():
@@ -3560,6 +3567,7 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     body["messages"] = normalize_chat_messages(messages, message_indices=message_indices)
     _normalize_tool_choice(body)
     body["stream"] = True
+    body = normalize_tool_patterns(body)
     body.setdefault("stream_options", {"include_usage": True})
     body = _chat_body_desensitize(body)
     _guard_request_size(body)
@@ -4078,11 +4086,12 @@ def _safe_err_raw(raw: bytes, status: int) -> dict:
         return {"error": {"message": raw.decode("utf-8", "replace")[:500], "type": "upstream_error", "code": status}}
 
 
-def _check_upstream_status(status, raw, cred, model, *, headers=None):
+def _check_upstream_status(status, raw, cred, model, *, headers=None, from_channel_fallback=False):
     if status != 200:
         retry_after = parse_retry_after((headers or {}).get("Retry-After"))
         if not is_filter_error(raw):
-            _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after)
+            _note_cred_status(cred, status, model=model, raw=raw, retry_after=retry_after,
+                              from_channel_fallback=from_channel_fallback)
         raise UpstreamHTTPError(status, raw, retry_after=retry_after)
 
 
@@ -4131,13 +4140,24 @@ async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *,
     filter_retried = False
     collection_limit = (CONFIG.get("max_collect_bytes", 0) if max_collect_bytes is None
                         else max_collect_bytes)
+    fallback_url = channel_fallback_url(url)
+    from_channel_fallback = False
     while True:
         accumulator = ChatSSEAccumulator(max_collect_bytes=collection_limit)
         rejection = None
         async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
             if response.status_code != 200:
-                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
-                                       headers=response.headers)
+                raw = await read_bounded_error(response)
+                if fallback_url and response.status_code == 400 and is_channel_check_error(raw):
+                    observe_attempt("channel_check_fallback", status_code=response.status_code,
+                                    profile=profile_for_headers(headers), upstream_model=body.get("model"))
+                    _log(f"[{rid}] 上游渠道校验，切换 /console 端点重试 | {model_name}")
+                    url = fallback_url
+                    fallback_url = None
+                    from_channel_fallback = True
+                    continue
+                _check_upstream_status(response.status_code, raw, cred, body.get("model"),
+                                       headers=response.headers, from_channel_fallback=from_channel_fallback)
             else:
                 _note_cred_model_ok(cred, body.get("model"))
             try:
@@ -4234,28 +4254,41 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
     budget = 0 if policy.realtime else (
         CONFIG["log_body_limit"] if CONFIG.get("log_path") else 0)
     repairer = dsml.SSERepairer(dsml.tool_name_allowlist(body))
+    fallback_url = channel_fallback_url(url)
+    from_channel_fallback = False
     try:
-        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
-            if response.status_code != 200:
-                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
-                                       headers=response.headers)
-            else:
-                _note_cred_model_ok(cred, body.get("model"))
-            async for line in response.aiter_lines():
-                broken = False
-                for out_line in repairer.feed(line):
-                    tracker.feed_line(out_line)
-                    if tracker.done or tracker.finish_reason:
-                        completed()  # Never expose a success marker before terminal validation.
-                    remaining = budget - len(preview)
-                    if remaining > 0:
-                        preview.extend((out_line[:remaining] + "\n").encode("utf-8")[:remaining])
-                    yield out_line
-                    if tracker.done:
-                        yield ""
-                        broken = True
-                if broken:
-                    break
+        while True:
+            async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
+                if response.status_code != 200:
+                    raw = await read_bounded_error(response)
+                    if fallback_url and response.status_code == 400 and is_channel_check_error(raw):
+                        observe_attempt("channel_check_fallback", status_code=response.status_code,
+                                        profile=profile_for_headers(headers), upstream_model=body.get("model"))
+                        _log(f"[{rid}] 上游渠道校验，切换 /console 端点重试 | {model_name}")
+                        url = fallback_url
+                        fallback_url = None
+                        from_channel_fallback = True
+                        continue
+                    _check_upstream_status(response.status_code, raw, cred, body.get("model"),
+                                           headers=response.headers, from_channel_fallback=from_channel_fallback)
+                else:
+                    _note_cred_model_ok(cred, body.get("model"))
+                async for line in response.aiter_lines():
+                    broken = False
+                    for out_line in repairer.feed(line):
+                        tracker.feed_line(out_line)
+                        if tracker.done or tracker.finish_reason:
+                            completed()  # Never expose a success marker before terminal validation.
+                        remaining = budget - len(preview)
+                        if remaining > 0:
+                            preview.extend((out_line[:remaining] + "\n").encode("utf-8")[:remaining])
+                        yield out_line
+                        if tracker.done:
+                            yield ""
+                            broken = True
+                    if broken:
+                        break
+            break
         for out_line in repairer.flush():   # 上游未发 DONE 就断流时，残留字节同样交还
             if not (tracker.done or tracker.finish_reason):
                 tracker.feed_line(out_line)
@@ -4335,7 +4368,7 @@ def _failover_safe(error, raw=b"") -> bool:
     if is_filter_error(raw):
         return False
     if isinstance(error, UpstreamHTTPError):
-        return error.status in FAILOVER_CODES
+        return error.status in FAILOVER_CODES or (error.status == 400 and is_channel_check_error(raw))
     if isinstance(error, UpstreamResponseError):
         return False
     if isinstance(error, WRITE_TIMEOUT_TRANSPORT):
